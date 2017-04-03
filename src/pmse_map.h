@@ -80,13 +80,16 @@ class PmseMap {
 
     ~PmseMap() = default;
 
-    uint64_t insert(persistent_ptr<T> value) {
+    uint64_t insert(persistent_ptr<T> value, persistent_ptr<KVPair> *kv = nullptr) {
         auto id = getNextId();
         stdx::lock_guard<nvml::obj::mutex> lock(_listMutex[id->idValue % _size]);
         if (!insertKV(id, value)) {
             return -1;
         }
         ++_hashmapSize;
+        if (kv) {
+            *kv = id;
+        }
         return id->idValue;
     }
 

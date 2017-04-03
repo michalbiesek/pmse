@@ -45,6 +45,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <mutex>
 
 #include "mongo/db/storage/record_store.h"
 #include "mongo/util/log.h"
@@ -78,10 +79,11 @@ PmseRecordStore::PmseRecordStore(StringData ns,
         std::string mapper_filename = _dbPath.toString() + ident.toString();
         if (!boost::filesystem::exists(mapper_filename.c_str())) {
             try {
-                _mapPool = pool<root>::create(mapper_filename, "pmse_mapper",
-                                              (ns.toString() == "local.startup_log" ||
-                                               ns.toString() == "_mdb_catalog" ? 10 : 80)
-                                              * PMEMOBJ_MIN_POOL);
+                _mapPool = pool<root>::create(mapper_filename, "kvmapper",
+                                             (ns.toString() == "local.startup_log" ||
+                                              ns.toString() == "_mdb_catalog" ||
+                                              ns.toString() == "admin.system.version" ? 10 : 80)
+                                             * PMEMOBJ_MIN_POOL);
             } catch (std::exception &e) {
                 log() << "Error handled: " << e.what();
                 throw;
@@ -126,6 +128,7 @@ StatusWith<RecordId> PmseRecordStore::insertRecord(OperationContext* txn,
                                     "object to insert exceeds cappedMaxSize");
     }
     persistent_ptr<InitData> obj;
+    persistent_ptr<KVPair> kv;
     uint64_t id = 0;
     try {
         transaction::exec_tx(_mapPool, [&obj, len, data] {
@@ -139,8 +142,12 @@ StatusWith<RecordId> PmseRecordStore::insertRecord(OperationContext* txn,
     if (obj == nullptr)
         return StatusWith<RecordId>(ErrorCodes::InternalError,
                                     "Not allocated memory!");
-    id = _mapper->insert(obj);
+    id = _mapper->insert(obj, &kv);
     _mapper->changeSize(len);
+    if (kv != nullptr) {
+        std::lock_guard<std::mutex> lock(_pmutex);
+        idToData.insert(std::pair<uint64_t, persistent_ptr<KVPair>>(id, kv));
+    }
     if (!id)
         return StatusWith<RecordId>(ErrorCodes::OperationFailed,
                                     "Null record Id!");
@@ -183,6 +190,7 @@ void PmseRecordStore::deleteRecord(OperationContext* txn,
     if (_mapper->getPair(dl.repr(), &p)) {
         _mapper->remove((uint64_t) dl.repr(), txn);
         _mapper->changeSize(-p->ptr->size);
+        idToData.erase(dl.repr());
     }
 }
 
@@ -191,8 +199,8 @@ void PmseRecordStore::setCappedCallback(CappedCallback* cb) {
 }
 
 void PmseRecordStore::cappedTruncateAfter(OperationContext* txn, RecordId end,
-                                          bool inclusive) {
-    PmseRecordCursor cursor(_mapper, true);
+                                               bool inclusive) {
+    PmseRecordCursor cursor(_mapper, true, idToData);
     auto rec = cursor.seekExact(end);
     if (!inclusive)
         rec = cursor.next();
@@ -202,6 +210,7 @@ void PmseRecordStore::cappedTruncateAfter(OperationContext* txn, RecordId end,
         rec = cursor.next();
         if (_cappedCallback) {
             deleteRecord(txn, id);
+            idToData.erase(id.repr());
             _cappedCallback->aboutToDeleteCapped(txn, id, data);
         }
     }
@@ -210,7 +219,17 @@ void PmseRecordStore::cappedTruncateAfter(OperationContext* txn, RecordId end,
 bool PmseRecordStore::findRecord(OperationContext* txn, const RecordId& loc,
                                  RecordData* rd) const {
     persistent_ptr<InitData> obj;
-    if (_mapper->find((uint64_t) loc.repr(), &obj)) {
+    persistent_ptr<KVPair> kv;
+    try {
+        kv = idToData.at(loc.repr());
+        obj = kv->ptr;
+    } catch (std::exception &e) {
+        log() << "FindRecord " << e.what();
+    }
+    if (obj) {
+        *rd = RecordData(obj->data, obj->size);
+        return true;
+    } else if (_mapper->find((uint64_t) loc.repr(), &obj)) {
         invariant(obj != nullptr);
         *rd = RecordData(obj->data, obj->size);
         return true;
@@ -226,6 +245,7 @@ void PmseRecordStore::deleteCappedAsNeeded(OperationContext* txn) {
         findRecord(txn, id, &data);
         _mapper->remove(idToDelete);
         _mapper->changeSize(-data.size());
+        idToData.erase(idToDelete);
         uassertStatusOK(_cappedCallback->aboutToDeleteCapped(txn, id, data));
     }
 }
@@ -244,9 +264,9 @@ void PmseRecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* 
     log() << "Not implemented: waitForAllEarlierOplogWritesToBeVisible";
 }
 
-PmseRecordCursor::PmseRecordCursor(persistent_ptr<PmseMap<InitData>> mapper, bool forward)
-    : _forward(forward),
-      _lastMoveWasRestore(false) {
+PmseRecordCursor::PmseRecordCursor(persistent_ptr<PmseMap<InitData>> mapper, bool forward,
+                                   const std::map<uint64_t, persistent_ptr<KVPair>> &map)
+        : _map(map), _forward(forward), _lastMoveWasRestore(false) {
     _mapper = mapper;
     _before = nullptr;
     _cur = nullptr;
@@ -369,7 +389,19 @@ boost::optional<Record> PmseRecordCursor::next() {
 
 boost::optional<Record> PmseRecordCursor::seekExact(const RecordId& id) {
     persistent_ptr<InitData> obj = nullptr;
-    bool status = _mapper->getPair(id.repr(), &_cur);
+    persistent_ptr<KVPair> kv = nullptr;
+    bool status; // = _mapper->getPair(id.repr(), _cur);
+    try {
+        kv = _map.at(id.repr());
+        _cur = kv;
+        obj = _cur->ptr;
+        status = true;
+    } catch (std::exception &e) {
+        log() << "PmseRecordCursor::seekExact " << e.what();
+    }
+    if(!obj)
+        status = _mapper->getPair(id.repr(), &_cur);
+
     if (_cur == nullptr || _cur->ptr == nullptr) {
         return boost::none;
     }

@@ -58,7 +58,8 @@ const uint64_t baseSize = 20480;
 
 class PmseRecordCursor final : public SeekableRecordCursor {
  public:
-    PmseRecordCursor(persistent_ptr<PmseMap<InitData>> mapper, bool forward);
+    PmseRecordCursor(persistent_ptr<PmseMap<InitData>> mapper, bool forward,
+                     const std::map<uint64_t, persistent_ptr<KVPair>> &map);
 
     boost::optional<Record> next();
 
@@ -81,6 +82,7 @@ class PmseRecordCursor final : public SeekableRecordCursor {
     bool checkPosition();
 
     persistent_ptr<PmseMap<InitData>> _mapper;
+    const std::map<uint64_t, persistent_ptr<KVPair>> &_map;
     persistent_ptr<KVPair> _before;
     persistent_ptr<KVPair> _cur;
     p<bool> _eof = false;
@@ -160,7 +162,7 @@ class PmseRecordStore : public RecordStore {
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* txn,
                                                     bool forward) const final {
-        return stdx::make_unique<PmseRecordCursor>(_mapper, forward);
+        return stdx::make_unique<PmseRecordCursor>(_mapper, forward, idToData);
     }
 
     virtual Status truncate(OperationContext* txn) {
@@ -212,7 +214,9 @@ class PmseRecordStore : public RecordStore {
                             BSONObjBuilder* output);
 
  private:
+    std::map<uint64_t, persistent_ptr<KVPair>> idToData;
     void deleteCappedAsNeeded(OperationContext* txn);
+    std::mutex _pmutex;
     CappedCallback* _cappedCallback;
     int64_t _storageSize = baseSize;
     CollectionOptions _options;
