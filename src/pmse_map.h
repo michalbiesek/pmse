@@ -249,6 +249,12 @@ class PmseMap {
         return _size;
     }
 
+    persistent_ptr<KVPair> getFirstPtr(int listNumber) {
+        if (listNumber < _size)
+            return _list[listNumber]->_head;
+        return {};
+    }
+
     nvml::obj::mutex _listMutex[HASHMAP_SIZE];
 
  private:
@@ -264,12 +270,6 @@ class PmseMap {
 
     nvml::obj::mutex _pmutex;
     persistent_ptr<KVPair> _deleted;
-
-    persistent_ptr<KVPair> getFirstPtr(int listNumber) {
-        if (listNumber < _size)
-            return _list[listNumber]->_head;
-        return {};
-    }
 
     persistent_ptr<KVPair> getNextId() {
             stdx::lock_guard<nvml::obj::mutex> guard(_pmutex);

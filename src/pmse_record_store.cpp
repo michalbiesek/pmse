@@ -41,6 +41,7 @@
 #include <libpmemobj++/mutex.hpp>
 #include <libpmemobj++/transaction.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -79,10 +80,10 @@ PmseRecordStore::PmseRecordStore(StringData ns,
         std::string mapper_filename = _dbPath.toString() + ident.toString();
         if (!boost::filesystem::exists(mapper_filename.c_str())) {
             try {
-                _mapPool = pool<root>::create(mapper_filename, "kvmapper",
+                _mapPool = pool<root>::create(mapper_filename, "pmse_mapper",
                                              (ns.toString() == "local.startup_log" ||
                                               ns.toString() == "_mdb_catalog" ||
-                                              ns.toString() == "admin.system.version" ? 10 : 80)
+                                              ns.toString() == "admin.system.version" ? 10 : 350)
                                              * PMEMOBJ_MIN_POOL);
             } catch (std::exception &e) {
                 log() << "Error handled: " << e.what();
@@ -109,9 +110,24 @@ PmseRecordStore::PmseRecordStore(StringData ns,
         });
         mapper_root->kvmap_root_ptr->initialize(true);
     } else {
-        transaction::exec_tx(_mapPool, [mapper_root] {
+        transaction::exec_tx(_mapPool, [this, mapper_root] {
             mapper_root->kvmap_root_ptr->initialize(false);
         });
+        // Iterate through all elements
+        log() << "Filling map with stored items";
+        std::chrono::time_point<std::chrono::high_resolution_clock> beg = std::chrono::high_resolution_clock::now();
+        for (int64_t i = 0; i < mapper_root->kvmap_root_ptr->getHashmapSize(); i++) {
+            // Get first element and move on
+            auto item = mapper_root->kvmap_root_ptr->getFirstPtr(i);
+            while (item != nullptr) {
+                // Insert item to STL Map
+                std::pair<uint64_t, persistent_ptr<KVPair>> p(item->idValue, item);
+                idToData.insert(p);
+                item = item->next;
+            }
+        }
+        log() << "Time of inserting: " << std::chrono::duration_cast<std::chrono::duration<double, std::ratio<1>>>(std::chrono::high_resolution_clock::now() - beg).count();
+        log() << "Filled with " << idToData.size() << " elements";
     }
     try {
         _mapper = _mapPool.get_root()->kvmap_root_ptr;

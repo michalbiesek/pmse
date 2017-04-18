@@ -56,14 +56,21 @@ PmseSortedDataInterface::PmseSortedDataInterface(StringData ident,
                                                  StringData dbpath,
                                                  std::map<std::string, pool_base> *pool_handler)
     : _dbpath(dbpath), _desc(desc) {
+    std::cout << "PmseSortedDataInterface: " << desc->parentNS() << std::endl;
     try {
         if (pool_handler->count(ident.toString()) > 0) {
             _pm_pool = pool<PmseTree>((*pool_handler)[ident.toString()]);
         } else {
             std::string filepath = _dbpath.toString() + ident.toString();
             if (!boost::filesystem::exists(filepath)) {
+                int multiplier = (desc->parentNS() == "local.startup_log" ||
+                                  desc->parentNS() == "_mdb_catalog" ||
+                                  desc->parentNS() == "admin.system.version" ? 20 : 140);
+                std::cout << "Mnoznik: " << multiplier << std::endl;
                 _pm_pool = pool<PmseTree>::create(filepath.c_str(), "pmse_index",
-                                                  10 * PMEMOBJ_MIN_POOL, 0666);
+                                                  multiplier * PMEMOBJ_MIN_POOL, 0666);
+//                _pm_pool = pool<PmseTree>::create(filepath.c_str(), "pmse_index",
+//                                                  20 * PMEMOBJ_MIN_POOL, 0666);
             } else {
                 _pm_pool = pool<PmseTree>::open(filepath.c_str(), "pmse_index");
             }
@@ -72,7 +79,7 @@ PmseSortedDataInterface::PmseSortedDataInterface(StringData ident,
         }
         _tree = _pm_pool.get_root();
     } catch (std::exception &e) {
-        log() << "Error handled: " << e.what();
+        log() << "Error handled in index: " << e.what();
         throw;
     }
 }
