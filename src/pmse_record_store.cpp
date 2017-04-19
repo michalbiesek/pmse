@@ -185,16 +185,30 @@ Status PmseRecordStore::updateRecord(OperationContext* txn, const RecordId& oldL
             obj = pmemobj_tx_alloc(sizeof(InitData::size) + len, 1);
             obj->size = len;
             memcpy(obj->data, data, len);
-            _mapper->updateKV(oldLocation.repr(), obj, txn);
+            auto kv = idToData.at(oldLocation.repr());
+            if (txn) {
+                txn->recoveryUnit()->registerChange(new UpdateChange(_mapPool,
+                                                                     oldLocation.repr(),
+                                                                     kv->ptr.get(),
+                                                                     kv->ptr->size));
+            }
+            try {
+                transaction::exec_tx(_mapPool, [&kv] {
+                    delete_persistent<InitData>(kv->ptr);
+                });
+                kv->ptr = obj;
+            } catch(std::exception &e) {
+                log() << e.what();
+            }
             _mapper->changeSize(obj->size - len);
             deleteCappedAsNeeded(txn);
         });
+        while (_mapper->dataSize() > _storageSize) {
+            _storageSize =  _storageSize + baseSize;
+        }
     } catch (std::exception &e) {
         log() << e.what();
         return Status(ErrorCodes::BadValue, e.what());
-    }
-    while (_mapper->dataSize() > _storageSize) {
-        _storageSize =  _storageSize + baseSize;
     }
     return Status::OK();
 }
@@ -202,8 +216,8 @@ Status PmseRecordStore::updateRecord(OperationContext* txn, const RecordId& oldL
 void PmseRecordStore::deleteRecord(OperationContext* txn,
                                    const RecordId& dl) {
     stdx::lock_guard<nvml::obj::mutex> lock(_mapper->_listMutex[dl.repr() % _mapper->getHashmapSize()]);
-    persistent_ptr<KVPair> p;
-    if (_mapper->getPair(dl.repr(), &p)) {
+    persistent_ptr<KVPair> p = idToData.at(dl.repr());
+    if (p != nullptr) {
         _mapper->remove((uint64_t) dl.repr(), txn);
         _mapper->changeSize(-p->ptr->size);
         idToData.erase(dl.repr());
@@ -240,7 +254,7 @@ bool PmseRecordStore::findRecord(OperationContext* txn, const RecordId& loc,
         kv = idToData.at(loc.repr());
         obj = kv->ptr;
     } catch (std::exception &e) {
-        log() << "FindRecord " << e.what();
+        log() << "Find record failure: " << e.what();
     }
     if (obj) {
         *rd = RecordData(obj->data, obj->size);
@@ -406,14 +420,14 @@ boost::optional<Record> PmseRecordCursor::next() {
 boost::optional<Record> PmseRecordCursor::seekExact(const RecordId& id) {
     persistent_ptr<InitData> obj = nullptr;
     persistent_ptr<KVPair> kv = nullptr;
-    bool status; // = _mapper->getPair(id.repr(), _cur);
+    bool status = false;
     try {
         kv = _map.at(id.repr());
         _cur = kv;
         obj = _cur->ptr;
         status = true;
     } catch (std::exception &e) {
-        log() << "PmseRecordCursor::seekExact " << e.what();
+        log() << "Cursor failure: " << e.what();
     }
     if(!obj)
         status = _mapper->getPair(id.repr(), &_cur);
@@ -526,11 +540,11 @@ void PmseRecordCursor::moveBackward() {
 }
 
 bool PmseRecordCursor::checkPosition() {
-        if (_cur != nullptr && _cur->position != _position) {  // Can come back to list, but with another pos
-            return false;
-        }
-        return true;
+    if (_cur != nullptr && _cur->position != _position) {  // Can come back to list, but with another pos
+        return false;
     }
+    return true;
+}
 
 }  // namespace mongo
 
